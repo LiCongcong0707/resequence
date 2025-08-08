@@ -1,0 +1,459 @@
+## Whole-Genome Resequencing and Population Genetics Analysis Handbook
+---
+
+## I. 原始数据处理阶段（Raw Data Processing）
+
+### 1. 原始测序数据
+
+- **目的**：获得下机的原始双端测序数据（适用于 Illumina、BGI、Oxford Nanopore、PacBio 等平台，常见格式为 `*.fq.gz` 或 `*.fastq.gz`）
+- **格式**：双端 reads：`sample_R1.fq.gz`, `sample_R2.fq.gz`
+
+---
+
+### 2. 数据质控（Quality Control）
+
+#### 2.1 FastQC：快速质量评估
+
+- **目的**：评估测序质量、污染和接头情况
+- **原理**：绘制 per-base quality、GC content、接头污染图谱
+
+```bash
+fastqc sample_R1.fq.gz sample_R2.fq.gz -o fastqc_raw/
+```
+
+#### 2.2 fastp：接头去除和低质过滤
+
+- **目的**：清除接头污染、低质量 reads
+- **原理**：自动识别接头并剪切，保留 Q20/Q30 高质量区域
+
+```bash
+fastp -i sample_R1.fq.gz -I sample_R2.fq.gz \
+      -o clean_R1.fq.gz -O clean_R2.fq.gz \
+      -h fastp_report.html -j fastp_report.json
+```
+
+---
+
+##  II. 数据比对与预处理
+
+### 3. 比对到参考基因组（BWA-MEM）
+
+- **目的**：将 reads 精确定位到参考序列上
+- **原理**：BWT 算法实现快速种子匹配和局部比对。目前推荐使用 BWA-MEM2（BWA 的并行优化版本），尤其适用于多线程高通量环境，兼容性与结果一致性良好。
+
+```bash
+bwa index ref.fa
+bwa mem2 -t 8 ref.fa clean_R1.fq.gz clean_R2.fq.gz > sample.sam
+```
+
+### 4. BAM 处理与去重
+
+- **目的**：转换为压缩格式、排序、标记 PCR 重复（推荐使用多线程工具如 sambamba 加快处理速度）
+
+> **Picard vs Sambamba MarkDuplicates 对比**：
+>
+> | 特性       | Picard                 | Sambamba  |
+> | -------- | ---------------------- | --------- |
+> | 编程语言     | Java                   | Rust      |
+> | 多线程支持    | 较弱（主要用于 I/O）           | 优秀（-t 参数） |
+> | 执行速度     | 较慢                     | 快         |
+> | 内存消耗     | 高                      | 低         |
+> | 输出统计     | 详细 duplication metrics | 简洁        |
+> | GATK 兼容性 | 高（推荐）                  | 高（结果兼容）   |
+>
+> **推荐：**
+>
+> - 小规模样本或 GATK 完全一致性要求 → 使用 Picard
+> - 多样本或大规模群体测序 → 使用 Sambamba
+
+```bash
+# 方法一：使用 samtools + picard（适合小规模或资源充足环境）
+# 将 SAM 转换为 BAM，并使用 8 线程排序输出
+samtools view -@ 8 -Sb sample.sam | samtools sort -@ 8 -o sample.sorted.bam
+# 标记 PCR 扩增重复，输出去重 BAM 和重复统计信息
+picard MarkDuplicates \
+    I=sample.sorted.bam \      # 输入排序后的 BAM 文件
+    O=sample.dedup.bam \        # 输出去重后的 BAM 文件
+    M=dup_metrics.txt           # 输出重复统计信息
+# 建立 BAM 索引，便于后续访问
+samtools index sample.dedup.bam
+
+# 方法二：使用 sambamba（多线程效率更高，推荐用于大规模 WGS）
+# SAM 转换为 BAM 并排序（-t 为线程数）
+sambamba view -t 8 -S -f bam sample.sam | \
+  sambamba sort -t 8 -o sample.sorted.bam /dev/stdin
+# 标记重复
+sambamba markdup -t 8 sample.sorted.bam sample.dedup.bam
+# 建立索引
+sambamba index -t 4 sample.dedup.bam
+```
+
+---
+
+## 🧬 III. 变异检测（Variant Calling）
+
+
+
+### 5. GATK HaplotypeCaller 流程（SNP/Indel）
+
+- **目的**：检测每个样本的变异位点
+- **原理**：通过局部 de-novo 组装寻找替代等位基因
+- **流程**：
+
+| 步骤 | 工具                | 目标                   |
+| -- | ----------------- | -------------------- |
+| 1  | HaplotypeCaller   | 每个样本按染色体生成 GVCF      |
+| 2  | CombineGVCFs      | 合并所有样本的某条染色体的 GVCF   |
+| 3  | GenotypeGVCFs     | 联合变异检测，生成 cohort VCF |
+| 4  | VariantFiltration | 硬过滤低质量变异             |
+| 5  | SelectVariants    | 拆分 SNP / Indel       |
+| 6  | 最终输出              | 用于 GWAS、功能注释等        |
+
+#### 5.1 准备参考索引
+
+```bash
+picard CreateSequenceDictionary R=ref.fa O=ref.dict
+samtools faidx ref.fa
+```
+
+#### 5.2 GVCF 模式检测每个样本
+
+```bash
+# 基本用法
+gatk HaplotypeCaller -R ref.fa -I sample.dedup.bam \
+    -O sample.g.vcf.gz -ERC GVCF
+
+### 分染色体运行以加速:
+#需准备参考基因组的染色体名列表 chr.list，每行一个染色体名###
+# 遍历每条染色体进行 HaplotypeCaller 分染色体调用
+while read chr; do
+  gatk HaplotypeCaller \
+    -R ref.fa \                             # 参考基因组
+    -I sample.dedup.bam \                   # 输入去重 BAM 文件
+    -O gvcf_by_chr/$chr/sample.$chr.g.vcf.gz \  # 按染色体输出 GVCF
+    -ERC GVCF \                             # 启用 GVCF 模式
+    -L $chr                                 # 只调用该染色体
+done < chr.list
+
+```
+
+#### 5.3 联合检测
+
+```bash
+gatk CombineGVCFs -R ref.fa \
+    -V sample1.g.vcf.gz -V sample2.g.vcf.gz \
+    -O cohort.g.vcf.gz
+
+gatk GenotypeGVCFs -R ref.fa -V cohort.g.vcf.gz \
+    -O cohort.raw.vcf.gz
+
+#分染色体
+# 假设样本列表 sample_list.txt，染色体列表 chr.list
+while read chr; do
+  # 合并所有样本该染色体的 GVCF
+  gatk CombineGVCFs \
+    -R ref.fa \
+    $(while read sample; do echo "-V gvcf_by_chr/$chr/${sample}.$chr.g.vcf.gz"; done < sample_list.txt) \
+    -O cohort_gvcf_by_chr/$chr.cohort.g.vcf.gz
+
+  # 联合基因分型
+  gatk GenotypeGVCFs \
+    -R ref.fa \
+    -V cohort_gvcf_by_chr/$chr.cohort.g.vcf.gz \
+    -O cohort_vcf_by_chr/$chr.cohort.vcf.gz
+done < chr.list
+
+
+## 通过GenomicsDBImport来合并变异的结果
+#流程
+样本GVCF（分染色体获得）
+  -->GenomicsDBImport（构建染色体级数据库）
+    --> GenotypeGVCFs（联合分型输出 VCF）
+
+# step1 built a sample map
+#一个制表符分隔的样本文件
+sample001 /path/to/sample001.chr01.g.vcf.gz
+sample002 /path/to/sample002.chr01.g.vcf.gz
+...
+保存为chr01.sample_map.txt
+
+#step2 built GenomicDb
+gatk GenomicsDBImport \  
+  -R ref.fa \
+  --genomicsdb-workspace-path genomicsdb/chr01 \ #替换为实际路径
+  --sample-name-map chr01.sample_map.txt \
+  -L chr01 \
+  --batch-size 150 \ 控制内存使用，100--200为宜
+  --reader-threads 4
+
+#step3 jointgenotype
+gatk GenotypeGVCFs \
+  -R ref.fa \
+  -V gendb://genomicsdb/chr01 \
+  -O cohort/chr01.vcf.gz
+
+在样本数量大时，使用GenomicDb的方式可以极大的提高运行速度
+```
+#### 5.4 变异过滤（VariantFiltration）
+
+```bash
+gatk VariantFiltration -R ref.fa -V cohort.raw.vcf.gz \
+    --filter-expression "QD < 2.0 || FS > 60.0" \
+    --filter-name "LowQual" -O cohort.filtered.vcf.gz
+
+###或者更详细
+gatk VariantFiltration -O chr5.Filt.vcf -V chr5.vcf 
+--cluster-window-size 10 
+--filter-expression "MQ0 >= 4 && ((MQ0 / (1.0 * DP)) > 0.1)" --filter-name "HARD_TO_VALIDATE" 
+--filter-expression "DP < 5 " --filter-name "LowCoverage" 
+--filter-expression "QUAL < 30.0 " --filter-name "VeryLowQual" 
+--filter-expression "QUAL > 30.0 && QUAL < 50.0 " --filter-name "LowQual" 
+--filter-expression "QD < 1.5 " --filter-name "LowQD"
+```
+#### 是否需要加参数-R来添加参考基因组？
+GATK 4 中的 VariantFiltration 说明：
+  -R is required only if certain annotations or filtering expressions require access to reference sequence information
+
+| 使用场景                                                                                                         | 是否必须加 `-R` |
+| ------------------------------------------------------------------------------------------------------------ | ---------- |
+| 使用 `FS`、`QD`、`MQ`、`QUAL` 等已有 INFO 字段进行过滤                                                                     |  不需要参考基因组 |
+| 使用 `VariantType`（如判断是否 indel/SNP）、`Context`, `Length`, `Windowing`, `SnpCluster`, `Mask` 等涉及 ref base 或位置的过滤 | 需要 `-R`  |
+保险起见可以都加上
+#### 硬过滤参数参考
+```
+--filter-expression "QD < 2.0"               --filter-name "LowQD"
+--filter-expression "FS > 60.0"              --filter-name "StrandBias"
+--filter-expression "MQ < 40.0"              --filter-name "LowMappingQual"
+--filter-expression "MQRankSum < -12.5"      --filter-name "BadMQBalance"
+--filter-expression "ReadPosRankSum < -8.0"  --filter-name "EdgeBias"
+```
+
+
+#### 5.5 提取变异类型
+这一步可以在联合基因分型后做，也可以在过滤低质量变异后操作
+```bash
+  # 提取变异类型
+  gatk SelectVariants -R base/example.fasta -V test.vcf -O test.snp.vcf --select-type-to-include SNP
+  # -R 参考基因组 -O 输出vcf文件 -V 输入vcf文件 --select-type-to-include 选取提取的变异类型(#SNP,MNP,INDEL,SYMBOLIC,MIXED)
+
+# 提取高质量SNP
+gatk SelectVariants \
+  -R ref.fa \
+  -V filtered_vcf/chr01.filtered.vcf.gz \
+  --select-type-to-include SNP \
+  --exclude-filtered \
+  -O snp_vcf/chr01.snp.vcf.gz
+
+# 提取高质量Indel
+gatk SelectVariants \
+  -R ref.fa \
+  -V filtered_vcf/chr01.filtered.vcf.gz \
+  --select-type-to-include INDEL \
+  --exclude-filtered \
+  -O indel_vcf/chr01.indel.vcf.gz
+```
+#### 5.6 合并染色体
+```
+gatk GatherVcfs \
+  -I snp_vcf/chr01.snp.vcf.gz \
+  -I snp_vcf/chr02.snp.vcf.gz \
+  ... \
+  -O final/cohort.snp.vcf.gz
+```
+#### 5.7 使用snpEff进行变异注释
+```bash
+# 准备输入数据
+ref.fa \ ref.gff3 \ vcf.gz
+#建库
+#A配置物种名
+cd snpEff/data/
+mkdir kiwifruit
+cp ~/ref.fa kiwifruit/sequences.fa
+cp ~/genes.gff3 kiwifruit/genes.gff
+#B编辑配置文件
+#打开 snpEff.config，在行尾添加
+kiwifruit.genome : Kiwifruit
+#C建库
+cd snpEff
+java -Xmx4g -jar snpEff.jar build -gff3 -v kiwifruit
+
+##执行注释生成注释报告
+java -Xmx4g -jar snpEff.jar -v kiwifruit cohort.snp.vcf.gz > cohort.snp.ann.vcf
+java -Xmx4g -jar snpEff.jar -v kiwifruit -stats cohort.snp.stats.html cohort.snp.vcf.gz > annotated.vcf
+
+```
+---
+##  IV. 群体变异处理
+
+### 6. VCF 合并与过滤
+
+- **目的**：统一变异位点格式，移除低质量与缺失
+
+```bash
+bcftools merge *.vcf.gz -Oz -o merged.vcf.gz
+vcftools --gzvcf merged.vcf.gz \
+  --minDP 5 --max-missing 0.8 --maf 0.05 \
+  --recode --out final
+```
+
+---
+
+##  V. 群体遗传分析
+
+### 7. PCA 主成分分析
+
+- **目的**：揭示群体间的遗传分化与结构
+- **原理**：基于 SNP 构建协方差矩阵，进行特征分解
+
+```bash
+plink --vcf final.recode.vcf --make-bed --out data
+plink --bfile data --pca 10 --out pca
+```
+
+### 8. Admixture 群体结构分析
+
+- **目的**：估算每个个体的祖先成分（K 组）
+
+```bash
+admixture data.bed 3 # 3 代表 K 值
+```
+
+### 9. 群体多样性与分化分析
+
+#### 9.1 核苷酸多样性（π）
+
+```bash
+vcftools --vcf final.recode.vcf --window-pi 10000 --out pi
+```
+
+#### 9.2 Tajima's D
+
+```bash
+vcftools --vcf final.recode.vcf --TajimaD 10000 --out tajima
+```
+
+#### 9.3 Fst 分化指数
+
+```bash
+vcftools --vcf final.recode.vcf \
+  --weir-fst-pop group1.txt --weir-fst-pop group2.txt \
+  --out fst
+```
+
+---
+
+##  VI. 变异注释与候选位点筛选
+
+### 10. SnpEff 注释
+
+- **目的**：注释变异功能位置（如启动子、外显子、非同义）
+
+```bash
+snpEff build -gff3 -v Actinidia_ref
+snpEff Actinidia_ref final.recode.vcf > annotated.vcf
+```
+
+### 11. 差异变异筛选
+
+- **目的**：筛选特定群体或性状的特异变异位点
+
+```bash
+vcftools --vcf annotated.vcf --keep group1.txt --recode --out group1
+vcftools --vcf annotated.vcf --keep group2.txt --recode --out group2
+vcftools --diff group1.recode.vcf group2.recode.vcf --out diff
+```
+
+### 12. GWAS 分析（以 GEMMA 为例）
+
+```bash
+# 假设已有 plink 文件和性状文件
+gemma -bfile data -p phenotype.txt -gk 1 -o kinship
+
+gemma -bfile data -p phenotype.txt -k output/kinship.cXX.txt \
+      -lmm 4 -o gwas_result
+```
+
+
+---
+
+##  一、是否可以后期剔除无表型样本？
+
+**答案：可以，而且推荐在 GWAS 前剔除。**
+
+> **VCF 中包含无表型样本并不会影响你前期的变异检测流程；只要在下游 GWAS 前过滤掉这些样本即可。**
+
+---
+
+##  原因分析：
+
+### 1. GVCF → VCF 的联合变异检测阶段：
+
+* 所有样本的 GVCF 用于构建 **全体样本的群体等位基因频率信息**；
+* 即使某个样本无表型，也对 **等位基因的频率估计、杂合性、置信度建模**有贡献；
+* **保留这些样本在群体 VCF 中是正确的策略。**
+
+---
+
+### 2. GWAS 阶段（如 plink, GEMMA, GAPIT 等）：
+
+* GWAS 工具一般要求 **VCF 与表型文件中样本完全匹配**；
+* 多余样本不会报错，但不会参与模型计算；
+* 更好的做法是：**提前过滤掉无表型的样本**，以免混淆。
+
+---
+
+##  二、VCF 中如何剔除无表型样本？
+
+###  方法 1：使用 `bcftools view -s`
+
+假设你有一个 **包含有表型的样本列表**，例如 `samples_with_phenotype.txt`：
+
+```
+sample001
+sample005
+sample007
+...
+```
+
+那么运行：
+
+```bash
+bcftools view \
+  -S samples_with_phenotype.txt \
+  -Oz -o gwas_ready.vcf.gz \
+  cohort.all.vcf.gz
+```
+
+这会生成一个 **只包含有表型样本** 的 VCF，可用于 PLINK、GEMMA、GAPIT 等工具。
+
+---
+
+###  方法 2：在转换为 plink/binary 格式时指定样本
+
+```bash
+plink --vcf cohort.all.vcf.gz \
+      --keep samples_with_phenotype.txt \
+      --make-bed --out gwas_input
+```
+
+> `--keep` 只会保留你指定的样本，其余的在生成 `.bed/.bim/.fam` 过程中就剔除了。
+
+---
+
+##  三、最佳实践流程建议
+
+| 阶段            | 操作                    | 样本范围          |
+| ------------- | --------------------- | ------------- |
+| GVCF 构建       | HaplotypeCaller       | 所有样本          |
+| GVCF 合并       | CombineGVCFs          | 所有样本          |
+| GenotypeGVCFs | 联合检测                  | 所有样本          |
+| GWAS 输入准备     | bcftools/plink 筛选样本   | 仅有表型的样本       |
+| GWAS 分析       | GAPIT / GEMMA / EMMAX | 表型 × VCF 一致样本 |
+
+---
+
+
+---
+
+
+
